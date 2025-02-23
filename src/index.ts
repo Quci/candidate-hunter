@@ -1,65 +1,68 @@
-// agent.ts
+import dotenv from "dotenv";
+import {ChatOpenAI} from "@langchain/openai";
+import path from "node:path";
+import {tool} from "@langchain/core/tools";
+import {z} from "zod";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 
-// IMPORTANT - Add your API keys here. Be careful not to publish them.
-process.env.OPENAI_API_KEY = "sk-...";
-process.env.TAVILY_API_KEY = "tvly-...";
+const envPath = path.resolve(__dirname, "./.env")
+dotenv.config({path: envPath});
 
-import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
-import { ChatOpenAI } from "@langchain/openai";
-import { HumanMessage, AIMessage } from "@langchain/core/messages";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
-import { StateGraph, MessagesAnnotation } from "@langchain/langgraph";
+const main = async () => {
+    const chatBoxSchema = z.object({
+        candidateId: z.string().describe('候选人ID，表示要给哪个候选人发送消息'),
+        messageType: z.enum(['TEXT', 'RESUME_REQUEST']).describe('消息类型：TEXT 表示向候选人发送文本消息，RESUME_REQUEST 表示向候选人请求简历'),
+        messageContent: z.string().optional().describe('发个候选人的消息内容：当 messageType 为 TEXT 时，messageContent 为文本消息内容。当 messageType 为 RESUME_REQUEST 时，messageContent 为空')
+    })
 
-// Define the tools for the agent to use
-const tools = [new TavilySearchResults({ maxResults: 3 })];
-const toolNode = new ToolNode(tools);
+    // 参考文档 https://js.langchain.com/docs/how_to/custom_tools/
+    const chatBoxTool = tool(
+        async ({candidateId, messageType, messageContent}) => {
+            console.log('messageType', messageType)
+            console.log('candidateId', candidateId)
+            console.log('messageContent', messageContent)
+            return '消息发送成功'
+        },
+        {
+            name: 'chatBox',
+            description: '在聊天室中给候选人发一条消息（仅当要和候选人聊天时才调用）。',
+            schema: chatBoxSchema,
+            responseFormat: 'content'
+        }
+    )
 
-// Create a model and give it access to the tools
-const model = new ChatOpenAI({
-	model: "gpt-4o-mini",
-	temperature: 0,
-}).bindTools(tools);
+    const  agentModel = new ChatOpenAI({
+        model: "gpt-4o",
+        temperature: 0.05
+    })
 
-// Define the function that determines whether to continue or not
-function shouldContinue({ messages }: typeof MessagesAnnotation.State) {
-	const lastMessage = messages[messages.length - 1] as AIMessage;
+    const agent = createReactAgent({
+        llm: agentModel,
+        tools: [chatBoxTool]
+    })
 
-	// If the LLM makes a tool call, then we route to the "tools" node
-	if (lastMessage.tool_calls?.length) {
-		return "tools";
-	}
-	// Otherwise, we stop (reply to the user) using the special "__end__" node
-	return "__end__";
+    const response = await  agent.invoke({
+        messages: [
+            new SystemMessage(`
+            你的角色是一个招聘者，目标是跟候选人聊天以获取他的简历。
+            接下来会有一段跟候选人的聊天对话，你需要根据聊天内容，判断是和他发一条消息，还是请求其简历。
+            请注意：
+                1. 每条聊天消息不要超过20字 
+                2. 给候选人发消息时，语气口语化一点，避免让候选人认为你是ai
+                3. 语气保持中立，不要进行价值判断，不要给出任何承诺，。比如不要说：这个岗位适合/不适合候选人，候选人的简历很好/很差等。
+                4. 如果情况你处理不了，不要回复候选人，直接结束任务
+            `),
+            new HumanMessage(`
+                下面有一段候选人和招聘者的对话列表，你需要按这个原则进行处理：没打招呼先打个招呼，接着索要其简历。
+                注意：如果你发现聊天记录中招聘者已经索要过简历，你不要和候选人聊天，也不需要索要简历。什么都不要不做，直接结束。
+                这是对话列表："候选人：你好，我对这个岗位很感兴趣;"
+            `)
+        ]
+    })
+
+    console.log('agent response', response)
+
 }
 
-// Define the function that calls the model
-async function callModel(state: typeof MessagesAnnotation.State) {
-	const response = await model.invoke(state.messages);
-
-	// We return a list, because this will get added to the existing list
-	return { messages: [response] };
-}
-
-// Define a new graph
-const workflow = new StateGraph(MessagesAnnotation)
-	.addNode("agent", callModel)
-	.addEdge("__start__", "agent") // __start__ is a special name for the entrypoint
-	.addNode("tools", toolNode)
-	.addEdge("tools", "agent")
-	.addConditionalEdges("agent", shouldContinue);
-
-// Finally, we compile it into a LangChain Runnable.
-const app = workflow.compile();
-
-// Use the agent
-const finalState = await app.invoke({
-	messages: [new HumanMessage("what is the weather in sf")],
-});
-console.log(finalState.messages[finalState.messages.length - 1].content);
-
-const nextState = await app.invoke({
-	// Including the messages from the previous run gives the LLM context.
-	// This way it knows we're asking about the weather in NY
-	messages: [...finalState.messages, new HumanMessage("what about ny")],
-});
-console.log(nextState.messages[nextState.messages.length - 1].content);
+main()
